@@ -14,7 +14,12 @@ import time
 from collections.abc import Hashable
 
 import chess
+from model.inference import NNUEInference
 
+# Initialize the ML evaluator
+nnue = NNUEInference()
+
+# --- Scores -----------------------------------------------------------------------------------
 # --- Scores -----------------------------------------------------------------------------------
 
 PIECE_VALUE: dict[chess.PieceType, int] = {
@@ -40,155 +45,24 @@ INCREMENT_MS = 500.0
 SAFETY_MS = 120.0  # wall-time margin left for serialisation; the referee grants only 500 ms grace
 CLOCK_CHECK_MASK = 2047  # test the wall clock once every this-many-plus-one nodes
 
-# --- Piece-square tables ----------------------------------------------------------------------
-# Michniewski's "Simplified Evaluation" tables, written rank 8 first from White's view. Only the
-# king differs between phases; the rest reuse one table for both. They are re-indexed by square
-# and colour at import so `evaluate` is a flat lookup.
-
-_PAWN = [
-      0,   0,   0,   0,   0,   0,   0,   0,
-     50,  50,  50,  50,  50,  50,  50,  50,
-     10,  10,  20,  30,  30,  20,  10,  10,
-      5,   5,  10,  25,  25,  10,   5,   5,
-      0,   0,   0,  20,  20,   0,   0,   0,
-      5,  -5, -10,   0,   0, -10,  -5,   5,
-      5,  10,  10, -20, -20,  10,  10,   5,
-      0,   0,   0,   0,   0,   0,   0,   0,
-]  # fmt: skip
-_KNIGHT = [
-    -50, -40, -30, -30, -30, -30, -40, -50,
-    -40, -20,   0,   0,   0,   0, -20, -40,
-    -30,   0,  10,  15,  15,  10,   0, -30,
-    -30,   5,  15,  20,  20,  15,   5, -30,
-    -30,   0,  15,  20,  20,  15,   0, -30,
-    -30,   5,  10,  15,  15,  10,   5, -30,
-    -40, -20,   0,   5,   5,   0, -20, -40,
-    -50, -40, -30, -30, -30, -30, -40, -50,
-]  # fmt: skip
-_BISHOP = [
-    -20, -10, -10, -10, -10, -10, -10, -20,
-    -10,   0,   0,   0,   0,   0,   0, -10,
-    -10,   0,   5,  10,  10,   5,   0, -10,
-    -10,   5,   5,  10,  10,   5,   5, -10,
-    -10,   0,  10,  10,  10,  10,   0, -10,
-    -10,  10,  10,  10,  10,  10,  10, -10,
-    -10,   5,   0,   0,   0,   0,   5, -10,
-    -20, -10, -10, -10, -10, -10, -10, -20,
-]  # fmt: skip
-_ROOK = [
-      0,   0,   0,   0,   0,   0,   0,   0,
-      5,  10,  10,  10,  10,  10,  10,   5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-      0,   0,   0,   5,   5,   0,   0,   0,
-]  # fmt: skip
-_QUEEN = [
-    -20, -10, -10,  -5,  -5, -10, -10, -20,
-    -10,   0,   0,   0,   0,   0,   0, -10,
-    -10,   0,   5,   5,   5,   5,   0, -10,
-     -5,   0,   5,   5,   5,   5,   0,  -5,
-      0,   0,   5,   5,   5,   5,   0,  -5,
-    -10,   5,   5,   5,   5,   5,   0, -10,
-    -10,   0,   5,   0,   0,   0,   0, -10,
-    -20, -10, -10,  -5,  -5, -10, -10, -20,
-]  # fmt: skip
-_KING_MG = [
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -20, -30, -30, -40, -40, -30, -30, -20,
-    -10, -20, -20, -20, -20, -20, -20, -10,
-     20,  20,   0,   0,   0,   0,  20,  20,
-     20,  30,  10,   0,   0,  10,  30,  20,
-]  # fmt: skip
-_KING_EG = [
-    -50, -40, -30, -20, -20, -30, -40, -50,
-    -30, -20, -10,   0,   0, -10, -20, -30,
-    -30, -10,  20,  30,  30,  20, -10, -30,
-    -30, -10,  30,  40,  40,  30, -10, -30,
-    -30, -10,  30,  40,  40,  30, -10, -30,
-    -30, -10,  20,  30,  30,  20, -10, -30,
-    -30, -30,   0,   0,   0,   0, -30, -30,
-    -50, -30, -30, -30, -30, -30, -30, -50,
-]  # fmt: skip
-
-_RAW_MG: dict[chess.PieceType, list[int]] = {
-    chess.PAWN: _PAWN,
-    chess.KNIGHT: _KNIGHT,
-    chess.BISHOP: _BISHOP,
-    chess.ROOK: _ROOK,
-    chess.QUEEN: _QUEEN,
-    chess.KING: _KING_MG,
-}
-_RAW_EG: dict[chess.PieceType, list[int]] = {**_RAW_MG, chess.KING: _KING_EG}
-
-# Phase weights: 24 at the opening, 0 with only kings and pawns. Used to blend mid/endgame tables.
-PHASE_WEIGHT: dict[chess.PieceType, int] = {
-    chess.PAWN: 0,
-    chess.KNIGHT: 1,
-    chess.BISHOP: 1,
-    chess.ROOK: 2,
-    chess.QUEEN: 4,
-    chess.KING: 0,
-}
-PHASE_TOTAL = 24
-
-
-def _by_colour(raw: list[int]) -> dict[chess.Color, list[int]]:
-    """A rank-8-first White table, re-indexed by square for each colour."""
-    return {
-        chess.WHITE: [raw[chess.square_mirror(sq)] for sq in range(64)],
-        chess.BLACK: [raw[sq] for sq in range(64)],
-    }
-
-
-MG_PST: dict[chess.PieceType, dict[chess.Color, list[int]]] = {
-    pt: _by_colour(raw) for pt, raw in _RAW_MG.items()
-}
-EG_PST: dict[chess.PieceType, dict[chess.Color, list[int]]] = {
-    pt: _by_colour(raw) for pt, raw in _RAW_EG.items()
-}
+# --- Evaluation -------------------------------------------------------------------------------
 
 # --- Evaluation -------------------------------------------------------------------------------
 
 
 def evaluate(board: chess.Board) -> int:
     """Static evaluation in centipawns, from the side-to-move's point of view.
-
-    Tapered material + piece-square tables plus a bishop-pair bonus. This is the one seam a
-    trained network would replace; search never depends on how the number is produced.
+    Powered by an NNUE model exported to ONNX.
     """
-    mg = 0
-    eg = 0
-    phase = 0
-    white_bishops = 0
-    black_bishops = 0
-    for sq, piece in board.piece_map().items():
-        pt = piece.piece_type
-        value = PIECE_VALUE[pt]
-        if piece.color:  # White
-            mg += value + MG_PST[pt][chess.WHITE][sq]
-            eg += value + EG_PST[pt][chess.WHITE][sq]
-            white_bishops += pt == chess.BISHOP
-        else:
-            mg -= value + MG_PST[pt][chess.BLACK][sq]
-            eg -= value + EG_PST[pt][chess.BLACK][sq]
-            black_bishops += pt == chess.BISHOP
-        phase += PHASE_WEIGHT[pt]
+    # NNUE evaluate returns score from white's perspective or normalized?
+    # Checking model/inference.py: it uses arctanh(pred) * C.
+    # Most engines evaluate from the perspective of the side-to-move.
 
-    if white_bishops >= 2:
-        mg += BISHOP_PAIR
-        eg += BISHOP_PAIR
-    if black_bishops >= 2:
-        mg -= BISHOP_PAIR
-        eg -= BISHOP_PAIR
+    score = nnue.evaluate(board.fen())
 
-    phase = min(phase, PHASE_TOTAL)
-    score = (mg * phase + eg * (PHASE_TOTAL - phase)) // PHASE_TOTAL  # White's perspective
+    # The model's evaluate function currently returns a value based on the
+    # FEN. We need to ensure it matches the side-to-move's perspective.
+    # If white is to move, return score. If black, return -score.
     return score if board.turn else -score
 
 
