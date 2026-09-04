@@ -276,6 +276,75 @@ def _bump_history(board: chess.Board, move: chess.Move, depth: int) -> None:
     _history[key] = _history.get(key, 0) + depth * depth
 
 
+# --- Static exchange evaluation ---------------------------------------------------------------
+# SEE resolves a full capture sequence on one square, so quiescence can skip captures that lose
+# material once the opponent recaptures optimally -- the exchanges the engine "did not see through".
+
+_SEE_ORDER = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
+
+
+def _attackers_to(board: chess.Board, square: chess.Square, occupied: int) -> int:
+    """Bitboard of every piece of either colour attacking `square` under the given occupancy.
+
+    Recomputed from occupancy each swap so x-ray attackers behind a captured piece are revealed.
+    """
+    white, black = board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK]
+    pawns = board.pawns
+    attackers = chess.BB_KNIGHT_ATTACKS[square] & board.knights
+    attackers |= chess.BB_KING_ATTACKS[square] & board.kings
+    attackers |= chess.BB_PAWN_ATTACKS[chess.BLACK][square] & pawns & white
+    attackers |= chess.BB_PAWN_ATTACKS[chess.WHITE][square] & pawns & black
+    diagonal = chess.BB_DIAG_ATTACKS[square][occupied & chess.BB_DIAG_MASKS[square]]
+    attackers |= diagonal & (board.bishops | board.queens)
+    rank = chess.BB_RANK_ATTACKS[square][occupied & chess.BB_RANK_MASKS[square]]
+    file = chess.BB_FILE_ATTACKS[square][occupied & chess.BB_FILE_MASKS[square]]
+    attackers |= (rank | file) & (board.rooks | board.queens)
+    return attackers & occupied
+
+
+def _see(board: chess.Board, move: chess.Move) -> int:
+    """Net centipawns for the side to move from playing the capture `move` out fully."""
+    to_square = move.to_square
+    if board.is_en_passant(move):
+        captured = PIECE_VALUE[chess.PAWN]
+    else:
+        victim = board.piece_type_at(to_square)
+        captured = PIECE_VALUE[victim] if victim else 0
+
+    mover = board.piece_type_at(move.from_square)
+    if mover is None:
+        return 0
+    occupied = board.occupied & ~chess.BB_SQUARES[move.from_square]
+    if board.is_en_passant(move):
+        occupied &= ~chess.BB_SQUARES[to_square + (-8 if board.turn == chess.WHITE else 8)]
+
+    attackers = _attackers_to(board, to_square, occupied)
+    gains = [captured]
+    on_square = PIECE_VALUE[mover]  # the piece now standing on to_square, exposed to recapture
+    side = not board.turn
+    depth = 0
+    while True:
+        available = attackers & board.occupied_co[side]
+        attacker_square = -1
+        for piece_type in _SEE_ORDER:
+            subset = available & board.pieces_mask(piece_type, side)
+            if subset:
+                attacker_square = chess.lsb(subset)
+                break
+        if attacker_square == -1:
+            break
+        depth += 1
+        gains.append(on_square - gains[depth - 1])
+        on_square = PIECE_VALUE[piece_type]
+        occupied &= ~chess.BB_SQUARES[attacker_square]
+        attackers = _attackers_to(board, to_square, occupied)
+        side = not side
+
+    for d in range(len(gains) - 1, 0, -1):  # negamax the gains back to the root capture
+        gains[d - 1] = -max(-gains[d - 1], gains[d])
+    return gains[0]
+
+
 # --- Search -----------------------------------------------------------------------------------
 
 
@@ -315,6 +384,10 @@ def _quiesce(board: chess.Board, alpha: int, beta: int, ply: int) -> int:
 
     captures = [m for m in board.legal_moves if board.is_capture(m) or m.promotion]
     for move in _order(board, captures, None, ply):
+        # Skip captures that lose material once the exchange is played out (the recapture the
+        # engine used to miss); promotions change the piece so SEE does not apply cleanly.
+        if not move.promotion and board.is_capture(move) and _see(board, move) < 0:
+            continue
         # Delta pruning: if even winning the target plus a margin can't reach alpha, skip it.
         if not move.promotion and stand_pat + _victim_value(board, move) + 200 < alpha:
             continue
