@@ -156,40 +156,58 @@ EG_PST: dict[chess.PieceType, dict[chess.Color, list[int]]] = {
 }
 
 # --- Evaluation -------------------------------------------------------------------------------
+# The scattered tables above are consolidated into weight tensors so evaluate is a dot product of
+# the position's piece planes (12: White P N B R Q K, then Black) with per-square material+PST
+# values. The tables stay the source of truth; the tensors are built from them once at import.
+
+
+def _build_eval_tensors() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    order = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+    mg = np.zeros((12, 64), np.int64)
+    eg = np.zeros((12, 64), np.int64)
+    phase = np.zeros(12, np.int64)
+    for plane, pt in enumerate(order):
+        for sq in range(64):
+            mg[plane][sq] = PIECE_VALUE[pt] + MG_PST[pt][chess.WHITE][sq]
+            eg[plane][sq] = PIECE_VALUE[pt] + EG_PST[pt][chess.WHITE][sq]
+            mg[plane + 6][sq] = -(PIECE_VALUE[pt] + MG_PST[pt][chess.BLACK][sq])
+            eg[plane + 6][sq] = -(PIECE_VALUE[pt] + EG_PST[pt][chess.BLACK][sq])
+        phase[plane] = phase[plane + 6] = PHASE_WEIGHT[pt]
+    return mg, eg, phase
+
+
+_MG_TENSOR, _EG_TENSOR, _PHASE_VEC = _build_eval_tensors()
 
 
 def evaluate(board: chess.Board) -> int:
     """Static evaluation in centipawns, from the side-to-move's point of view.
 
-    Tapered material + piece-square tables plus a bishop-pair bonus. This is the one seam a
-    trained network would replace; search never depends on how the number is produced.
+    Tapered material + piece-square tables plus a bishop-pair bonus, as a dot product of the piece
+    planes with the weight tensors. This is the one seam a trained network would replace; search
+    never depends on how the number is produced.
     """
-    mg = 0
-    eg = 0
-    phase = 0
-    white_bishops = 0
-    black_bishops = 0
-    for sq, piece in board.piece_map().items():
-        pt = piece.piece_type
-        value = PIECE_VALUE[pt]
-        if piece.color:  # White
-            mg += value + MG_PST[pt][chess.WHITE][sq]
-            eg += value + EG_PST[pt][chess.WHITE][sq]
-            white_bishops += pt == chess.BISHOP
-        else:
-            mg -= value + MG_PST[pt][chess.BLACK][sq]
-            eg -= value + EG_PST[pt][chess.BLACK][sq]
-            black_bishops += pt == chess.BISHOP
-        phase += PHASE_WEIGHT[pt]
+    white = board.occupied_co[chess.WHITE]
+    black = board.occupied_co[chess.BLACK]
+    bitboards = np.array(
+        [board.pawns & white, board.knights & white, board.bishops & white, board.rooks & white,
+         board.queens & white, board.kings & white,
+         board.pawns & black, board.knights & black, board.bishops & black, board.rooks & black,
+         board.queens & black, board.kings & black],
+        dtype=np.uint64,
+    )
+    bits = np.unpackbits(bitboards.view(np.uint8), bitorder="little")
+    planes = bits.reshape(12, 64).astype(np.int64)
 
-    if white_bishops >= 2:
+    mg = int((planes * _MG_TENSOR).sum())
+    eg = int((planes * _EG_TENSOR).sum())
+    phase = min(int((planes * _PHASE_VEC[:, None]).sum()), PHASE_TOTAL)
+    if int(planes[2].sum()) >= 2:  # White bishop pair
         mg += BISHOP_PAIR
         eg += BISHOP_PAIR
-    if black_bishops >= 2:
+    if int(planes[8].sum()) >= 2:  # Black bishop pair
         mg -= BISHOP_PAIR
         eg -= BISHOP_PAIR
 
-    phase = min(phase, PHASE_TOTAL)
     score = (mg * phase + eg * (PHASE_TOTAL - phase)) // PHASE_TOTAL  # White's perspective
     return score if board.turn else -score
 
