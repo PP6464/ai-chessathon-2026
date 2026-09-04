@@ -2,10 +2,9 @@
 
 A classical engine: iterative-deepening negamax with alpha-beta, a transposition table,
 MVV-LVA / killer / history move ordering, quiescence at the leaves, and a tapered
-material + piece-square evaluation. No learned model is required by the rules; this is a
-complete entry. The evaluation is isolated in `evaluate` so a trained net can replace it later.
+material + piece-square evaluation. Uses a PyTorch model for position evaluation.
 
-Import time runs once per game inside a 60 second budget, before the clock starts. The tables
+Import time runs once per game inside a 60-second budget, before the clock starts. The tables
 below are built here, not inside get_move. Module state (the transposition table, killer and
 history tables) survives between our moves within a game, never to the next game.
 """
@@ -19,7 +18,6 @@ from model.inference import NNUEInference
 # Initialize the ML evaluator
 nnue = NNUEInference()
 
-# --- Scores -----------------------------------------------------------------------------------
 # --- Scores -----------------------------------------------------------------------------------
 
 PIECE_VALUE: dict[chess.PieceType, int] = {
@@ -44,8 +42,6 @@ EXACT, LOWER, UPPER = 0, 1, 2
 INCREMENT_MS = 500.0
 SAFETY_MS = 120.0  # wall-time margin left for serialisation; the referee grants only 500 ms grace
 CLOCK_CHECK_MASK = 2047  # test the wall clock once every this-many-plus-one nodes
-
-# --- Evaluation -------------------------------------------------------------------------------
 
 # --- Evaluation -------------------------------------------------------------------------------
 
