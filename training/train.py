@@ -129,7 +129,7 @@ def train():
     print(f"Test MSE: {test_loss / test_count:.6f}")
 
     # Save weights
-    torch.save(model.state_dict(), "../model/weights.pth")
+    torch.save(model.state_dict(), "model/weights.pth")
     print("Weights saved to model/weights.pth")
 
 
