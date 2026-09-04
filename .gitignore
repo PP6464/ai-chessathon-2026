@@ -6,4 +6,5 @@ submission.zip
 *.pgn
 .idea
 *.pth
+*.log
 data/
