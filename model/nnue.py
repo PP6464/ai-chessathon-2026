@@ -8,8 +8,14 @@ class NNUE(nn.Module):
     """
     def __init__(self, input_dim=768, hidden_dim=256):
         super(NNUE, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+
+        # We separate the first layer to allow for incremental updates (True NNUE)
+        self.l1 = nn.Linear(input_dim, hidden_dim)
+
+        # The rest of the network
+        self.rest = nn.Sequential(
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -17,7 +23,14 @@ class NNUE(nn.Module):
         )
 
     def forward(self, x):
-        return self.network(x)
+        # Full forward pass (used for training)
+        x = self.l1(x)
+        x = self.rest(x)
+        return x
+
+    def get_l1_weights(self):
+        """Returns the weights and bias of the first layer for incremental updates."""
+        return self.l1.weight.data, self.l1.bias.data
 
 def fen_to_nnue_input(fen):
     """

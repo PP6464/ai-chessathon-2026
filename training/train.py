@@ -16,11 +16,11 @@ from torch.utils.data import DataLoader, IterableDataset
 from model.nnue import NNUE, fen_to_nnue_input
 
 # --- Configuration ---
-C = 300.0  # Centipawn scaling factor for tanh normalization
+C = 150.0  # Centipawn scaling factor for tanh normalization
 BATCH_SIZE = 512
 EPOCHS = 1
 LEARNING_RATE = 0.001
-MAX_SAMPLES = 1_000_000  # Limit for this implementation to avoid infinite run
+MAX_SAMPLES = 2_000_000  # Increased to 2M samples
 
 
 class ChessDataset(IterableDataset):

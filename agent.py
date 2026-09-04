@@ -11,12 +11,19 @@ history tables) survives between our moves within a game, never to the next game
 
 import time
 from collections.abc import Hashable
+import os
 
 import chess
-from model.inference import NNUEInference
+import numpy as np
+from model.inference import NNUEIncremental
 
 # Initialize the ML evaluator
-nnue = NNUEInference()
+# Allow overriding the model directory via environment variable for testing/arena
+model_dir = os.environ.get("MODEL_DIR", "model")
+nnue = NNUEIncremental(
+    weights_path=f"{model_dir}/weights_l1.npz",
+    model_path=f"{model_dir}/weights.onnx"
+)
 
 # --- Scores -----------------------------------------------------------------------------------
 
@@ -45,20 +52,52 @@ CLOCK_CHECK_MASK = 2047  # test the wall clock once every this-many-plus-one nod
 
 # --- Evaluation -------------------------------------------------------------------------------
 
+# Global accumulator for True NNUE
+_accumulator = np.zeros(256, dtype=np.float32)
+
+def _get_delta(board: chess.Board, move: chess.Move) -> np.ndarray:
+    """
+    Calculates the change in the accumulator for a given move.
+    The board is assumed to be in the state BEFORE the move.
+    """
+    global _accumulator
+    # 1. Identify squares that change
+    squares = {move.from_square, move.to_square}
+    if board.ep_square is not None:
+        squares.add(board.ep_square)
+
+    # Handle castling
+    if abs(chess.square_file(move.from_square) - chess.square_file(move.to_square)) == 2:
+        if move.to_square == chess.G1:
+            squares.update({chess.H1, chess.F1})
+        elif move.to_square == chess.C1:
+            squares.update({chess.A1, chess.D1})
+        elif move.to_square == chess.G8:
+            squares.update({chess.H8, chess.F8})
+        elif move.to_square == chess.C8:
+            squares.update({chess.A8, chess.D8})
+
+    # 2. Contribution before move
+    before = np.zeros(256, dtype=np.float32)
+    for sq in squares:
+        p = board.piece_at(sq)
+        before += nnue.get_square_weight(sq, p)
+
+    # 3. Contribution after move
+    board.push(move)
+    after = np.zeros(256, dtype=np.float32)
+    for sq in squares:
+        p = board.piece_at(sq)
+        after += nnue.get_square_weight(sq, p)
+    board.pop()
+
+    return after - before
 
 def evaluate(board: chess.Board) -> int:
     """Static evaluation in centipawns, from the side-to-move's point of view.
-    Powered by an NNUE model exported to ONNX.
+    Uses the incremental NNUE accumulator.
     """
-    # NNUE evaluate returns score from white's perspective or normalized?
-    # Checking model/inference.py: it uses arctanh(pred) * C.
-    # Most engines evaluate from the perspective of the side-to-move.
-
-    score = nnue.evaluate(board.fen())
-
-    # The model's evaluate function currently returns a value based on the
-    # FEN. We need to ensure it matches the side-to-move's perspective.
-    # If white is to move, return score. If black, return -score.
+    score = nnue.evaluate(_accumulator)
     return score if board.turn else -score
 
 
@@ -156,6 +195,8 @@ def _is_draw(board: chess.Board) -> bool:
 
 def _quiesce(board: chess.Board, alpha: int, beta: int, ply: int) -> int:
     """Search only forcing moves to a quiet position so evaluation is never read mid-exchange."""
+    global _accumulator
+
     _check_time()
     if ply >= MAX_PLY:
         return evaluate(board)
@@ -164,9 +205,12 @@ def _quiesce(board: chess.Board, alpha: int, beta: int, ply: int) -> int:
         # In check the side to move is not free to stand pat; search every evasion.
         best = -INF
         for move in _order(board, list(board.legal_moves), None, ply):
+            delta = _get_delta(board, move)
+            _accumulator += delta
             board.push(move)
             score = -_quiesce(board, -beta, -alpha, ply + 1)
             board.pop()
+            _accumulator -= delta
             if score > best:
                 best = score
             if best > alpha:
@@ -186,9 +230,12 @@ def _quiesce(board: chess.Board, alpha: int, beta: int, ply: int) -> int:
         # Delta pruning: if even winning the target plus a margin can't reach alpha, skip it.
         if not move.promotion and stand_pat + _victim_value(board, move) + 200 < alpha:
             continue
+        delta = _get_delta(board, move)
+        _accumulator += delta
         board.push(move)
         score = -_quiesce(board, -beta, -alpha, ply + 1)
         board.pop()
+        _accumulator -= delta
         if score >= beta:
             return score
         if score > alpha:
@@ -198,6 +245,7 @@ def _quiesce(board: chess.Board, alpha: int, beta: int, ply: int) -> int:
 
 def _search(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> int:
     """Fail-soft negamax with alpha-beta and a transposition table."""
+    global _accumulator
     _check_time()
 
     if ply > 0 and _is_draw(board):
@@ -231,9 +279,12 @@ def _search(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
     best = -INF
     best_move: chess.Move | None = None
     for move in _order(board, moves, tt_move, ply):
+        delta = _get_delta(board, move)
+        _accumulator += delta
         board.push(move)
         score = -_search(board, depth - 1, -beta, -alpha, ply + 1)
         board.pop()
+        _accumulator -= delta
         if score > best:
             best = score
             best_move = move
@@ -251,6 +302,7 @@ def _search(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
 
 
 def _search_root(board: chess.Board, depth: int) -> tuple[int, chess.Move | None]:
+    global _accumulator
     alpha, beta = -INF, INF
     best = -INF
     best_move: chess.Move | None = None
@@ -258,9 +310,12 @@ def _search_root(board: chess.Board, depth: int) -> tuple[int, chess.Move | None
     entry = _tt.get(key)
     tt_move = entry[3] if entry is not None else None
     for move in _order(board, list(board.legal_moves), tt_move, 0):
+        delta = _get_delta(board, move)
+        _accumulator += delta
         board.push(move)
         score = -_search(board, depth - 1, -beta, -alpha, 1)
         board.pop()
+        _accumulator -= delta
         if score > best:
             best = score
             best_move = move
@@ -285,9 +340,12 @@ def _budget_seconds(time_left_ms: int) -> float:
 
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation for the side to move in `fen`."""
-    global _nodes, _deadline, _killers, _history
+    global _nodes, _deadline, _killers, _history, _accumulator
 
     board = chess.Board(fen)
+    # Initialize the accumulator for the current position
+    _accumulator = nnue.get_initial_accumulator(board)
+
     legal = list(board.legal_moves)
     if not legal:
         return "0000"  # the referee has already ended the game; never actually reached
