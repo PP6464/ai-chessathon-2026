@@ -12,7 +12,6 @@ history tables) survives between our moves within a game, never to the next game
 
 import time
 from collections.abc import Hashable
-from pathlib import Path
 
 import chess
 import numpy as np
@@ -178,6 +177,49 @@ def _build_eval_tensors() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 _MG_TENSOR, _EG_TENSOR, _PHASE_VEC = _build_eval_tensors()
 
+# --- Endgame mop-up (drive a lone king to the edge) -------------------------------------------
+# Material + PST never reward cornering a bare enemy king, so a winning side can shuffle or even
+# stalemate. When one side is up ~a rook and the other has no pawns, reward pushing the losing king
+# to the edge and marching our king up -- the standard mop-up evaluation. Gated to the endgame so
+# the hot midgame path (the dot product above) is untouched.
+
+_ENDGAME_PIECE_CAP = 8  # only look for a mop-up mate when this few pieces remain
+_MOPUP_EDGE = 450  # the winning side must be up at least ~a rook for cornering to be the plan
+_MATERIAL = (100, 320, 330, 500, 900)  # pawn, knight, bishop, rook, queen (for the mop-up gate)
+
+
+def _center_manhattan_distance(square: chess.Square) -> int:
+    """0 in the four centre squares, up to 6 in a corner."""
+    file = chess.square_file(square)
+    rank = chess.square_rank(square)
+    return max(3 - file, file - 4) + max(3 - rank, rank - 4)
+
+
+def _king_distance(a: chess.Square, b: chess.Square) -> int:
+    df = abs(chess.square_file(a) - chess.square_file(b))
+    dr = abs(chess.square_rank(a) - chess.square_rank(b))
+    return df + dr
+
+
+def _mopup_bonus(planes: np.ndarray, board: chess.Board) -> int:
+    """Bonus (White's view) for driving a lone enemy king to the edge in a won K-vs-K endgame."""
+    counts = planes.sum(axis=1)
+    white = sum(int(counts[i]) * value for i, value in enumerate(_MATERIAL))
+    black = sum(int(counts[i + 6]) * value for i, value in enumerate(_MATERIAL))
+    if white - black >= _MOPUP_EDGE and int(counts[6]) == 0:  # White up material, Black pawnless
+        winner, loser, sign = chess.WHITE, chess.BLACK, 1
+    elif black - white >= _MOPUP_EDGE and int(counts[0]) == 0:  # Black up material, White pawnless
+        winner, loser, sign = chess.BLACK, chess.WHITE, -1
+    else:
+        return 0
+    loser_king = board.king(loser)
+    winner_king = board.king(winner)
+    if loser_king is None or winner_king is None:
+        return 0
+    corner = _center_manhattan_distance(loser_king)
+    closeness = 14 - _king_distance(winner_king, loser_king)
+    return sign * int(4.7 * corner + 1.6 * closeness)
+
 
 def evaluate(board: chess.Board) -> int:
     """Static evaluation in centipawns, from the side-to-move's point of view.
@@ -209,6 +251,8 @@ def evaluate(board: chess.Board) -> int:
         eg -= BISHOP_PAIR
 
     score = (mg * phase + eg * (PHASE_TOTAL - phase)) // PHASE_TOTAL  # White's perspective
+    if int(planes.sum()) <= _ENDGAME_PIECE_CAP:  # endgame only: cheap, off the midgame hot path
+        score += _mopup_bonus(planes, board)
     return score if board.turn else -score
 
 
@@ -419,6 +463,12 @@ def _quiesce(board: chess.Board, alpha: int, beta: int, ply: int) -> int:
     return alpha
 
 
+def _has_non_pawn_material(board: chess.Board, color: chess.Color) -> bool:
+    """True if `color` has a piece other than king and pawns; a zugzwang guard for null moves."""
+    pieces = board.occupied_co[color]
+    return bool((board.knights | board.bishops | board.rooks | board.queens) & pieces)
+
+
 def _search(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> int:
     """Fail-soft negamax with alpha-beta and a transposition table."""
     _check_time()
@@ -446,6 +496,24 @@ def _search(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
 
     if depth <= 0:
         return _quiesce(board, alpha, beta, ply)
+
+    # Null-move pruning: if passing the move (a free move for the opponent) still fails high, the
+    # real position is at least that good, so prune. Skipped in check (illegal to pass), near the
+    # root, when proving a mate, and in near-pawn endgames where zugzwang breaks the assumption.
+    if (
+        not board.is_check()
+        and depth >= 3
+        and ply > 0
+        and abs(beta) < MATE_IN_MAX
+        and _has_non_pawn_material(board, board.turn)
+        and evaluate(board) >= beta
+    ):
+        reduction = 2 + depth // 6
+        board.push(chess.Move.null())
+        null_score = -_search(board, depth - 1 - reduction, -beta, -beta + 1, ply + 1)
+        board.pop()
+        if null_score >= beta:
+            return beta
 
     moves = list(board.legal_moves)
     if not moves:
@@ -503,84 +571,14 @@ def _budget_seconds(time_left_ms: int) -> float:
     return max(0.0, (budget_ms - SAFETY_MS) / 1000.0)
 
 
-# --- Opening policy net -----------------------------------------------------------------------
-# A small MLP, trained offline on human opening statistics (training/train_opening.py), proposes
-# an opening move so we play theory near-instantly and bank clock for the middlegame. It only ever
-# suggests; the classical search below is the authority and every suggestion is checked before use.
-# If the weights are absent the agent is a pure classical engine, unchanged.
-
-_OPENING_FULLMOVES = 8  # stop consulting the net past here; it was trained on the first 16 plies
-_OPENING_CONFIDENCE = 0.20  # below this the position is out of the net's distribution: search
-_OPENING_VETO_DEPTH = 4  # depth of the sanity search that guards against a booked blunder
-_OPENING_VETO_MARGIN = 90  # centipawns the book move may trail the search's best before we refuse
-
-_N_FEATURES = 12 * 64 + 5  # 12 piece planes x 64 squares, then side-to-move + four castling rights
-_WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "opening.npz"
-
-# Loaded once at import (inside the 60 s budget); None means "no net, stay classical".
-_net_layers: list[tuple[np.ndarray, np.ndarray]] | None
-try:
-    with np.load(_WEIGHTS_PATH) as _weights:
-        _net_layers = [(_weights[f"w{i}"], _weights[f"b{i}"]) for i in range(3)]
-except (OSError, KeyError):
-    _net_layers = None
-
-
-def encode(board: chess.Board) -> np.ndarray:
-    """A position as a flat float32 feature vector. Must match training/train_opening.py exactly."""
-    features = np.zeros(_N_FEATURES, dtype=np.float32)
-    for square, piece in board.piece_map().items():
-        plane = (0 if piece.color else 6) + (piece.piece_type - 1)
-        features[plane * 64 + square] = 1.0
-    base = 12 * 64
-    features[base] = 1.0 if board.turn else 0.0
-    features[base + 1] = float(board.has_kingside_castling_rights(chess.WHITE))
-    features[base + 2] = float(board.has_queenside_castling_rights(chess.WHITE))
-    features[base + 3] = float(board.has_kingside_castling_rights(chess.BLACK))
-    features[base + 4] = float(board.has_queenside_castling_rights(chess.BLACK))
-    return features
-
-
-def _forward(features: np.ndarray) -> np.ndarray:
-    """Move logits from the position features: a two-hidden-layer ReLU MLP in plain numpy."""
-    assert _net_layers is not None
-    activation = features
-    for index, (weight, bias) in enumerate(_net_layers):
-        activation = weight @ activation + bias
-        if index < len(_net_layers) - 1:
-            activation = np.maximum(activation, 0.0)
-    return np.asarray(activation, dtype=np.float32)
-
-
-def _opening_move(board: chess.Board) -> chess.Move | None:
-    """The net's move for this position, or None to defer to the classical search.
-
-    Guards, in order: only inside the opening; the net must be confident (else it is out of
-    distribution); and the move must survive a shallow search so we never play a booked blunder.
-    """
-    if _net_layers is None or board.fullmove_number > _OPENING_FULLMOVES:
-        return None
-
-    logits = _forward(encode(board))
-    legal = list(board.legal_moves)
-    indices = [move.from_square * 64 + move.to_square for move in legal]
-    values = logits[indices].astype(np.float64)
-
-    best_i = int(values.argmax())
-    exp = np.exp(values - values.max())
-    if float(exp[best_i] / exp.sum()) < _OPENING_CONFIDENCE:
-        return None  # flat distribution: unfamiliar position, let the search decide
-
-    best = legal[best_i]
-    # Veto on a copy: the search pushes/pops, and a _TimeUp mid-search must never leave the
-    # caller's board mutated, or the fallback would move from the wrong position (an illegal move).
-    probe = board.copy()
-    reference, search_best = _search_root(probe, _OPENING_VETO_DEPTH)
-    if best == search_best:
-        return best  # the search agrees; no need to double-check
-    probe.push(best)
-    book_score = -_search(probe, _OPENING_VETO_DEPTH - 1, -INF, INF, 1)
-    return best if book_score + _OPENING_VETO_MARGIN >= reference else None
+# --- Opening book: REMOVED (it made the engine weaker) ----------------------------------------
+# A learned opening net (a small MLP over human opening statistics) used to live here and propose
+# the first several moves. Benchmarking retired it: over 72 games each vs our old classical bot the
+# engine scored ~61% with the net OFF but only ~50% with it ON. Its repertoire steered into dubious
+# lines (e.g. a passive Scandinavian) that cost more than the instant-book time it saved, so it is
+# turned off: no weights ship (weights/ deleted), and get_move goes straight to the classical
+# search. The training pipeline under training/ is kept in case a curated repertoire is worth
+# revisiting -- but as built, the net hurt, so it stays out.
 
 
 # --- Entry point ------------------------------------------------------------------------------
@@ -601,14 +599,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
     _nodes = 0
     _killers = [[None, None] for _ in range(MAX_PLY + 1)]
     _history = {}
-
-    # Play theory near-instantly when the net offers a vetted move; any failure degrades to search.
-    try:
-        opening = _opening_move(board)
-    except Exception:  # the learned path must never crash a game; the search below is the fallback
-        opening = None
-    if opening is not None and opening in board.legal_moves:  # never return an illegal move
-        return opening.uci()
 
     # Order the root once so the fallback is a sane move even if depth 1 never completes.
     best_move = _order(board, legal, None, 0)[0]
